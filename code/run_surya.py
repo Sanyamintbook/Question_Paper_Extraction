@@ -15,17 +15,30 @@ from pathlib import Path
 CODE_ROOT = Path(__file__).resolve().parent
 ROOT = CODE_ROOT.parent
 CACHE = ROOT / ".cache"
+CPU_LLAMA_BINARY = ROOT / "tools" / "llama.cpp" / "llama-server.exe"
+CUDA_LLAMA_DIRECTORY = ROOT / "tools" / "llama.cpp-cuda"
+CUDA_LLAMA_BINARY = next(
+    iter(sorted(CUDA_LLAMA_DIRECTORY.glob("**/llama-server.exe"))),
+    CUDA_LLAMA_DIRECTORY / "llama-server.exe",
+)
+# CUDA is optional: retain the proven CPU backend unless the official CUDA
+# binary has been installed beside it.  Twelve offloaded layers is a cautious
+# starting point for the workstation's 6 GB Quadro P3000.
+GPU_BACKEND_AVAILABLE = CUDA_LLAMA_BINARY.is_file()
+DEFAULT_GPU_LAYERS = os.environ.get("SURYA_GPU_LAYERS", "12") if GPU_BACKEND_AVAILABLE else "0"
 os.environ.setdefault("HF_HOME", str(CACHE / "huggingface"))
 os.environ.setdefault("HF_HUB_CACHE", str(CACHE / "huggingface" / "hub"))
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TORCH_HOME", str(CACHE / "torch"))
 os.environ.setdefault("XDG_CACHE_HOME", str(CACHE))
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+# Do not expose the GPU to the CPU binary.  The CUDA binary receives device 0
+# and a limited layer count; users can override SURYA_GPU_LAYERS if benchmarked.
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0" if GPU_BACKEND_AVAILABLE else "")
 os.environ.setdefault("TORCH_DEVICE", "cpu")
 os.environ.setdefault("SURYA_INFERENCE_BACKEND", "llamacpp")
-os.environ.setdefault("LLAMA_CPP_BINARY", str(ROOT / "tools" / "llama.cpp" / "llama-server.exe"))
-os.environ.setdefault("LLAMA_CPP_NGL", "0")
+os.environ.setdefault("LLAMA_CPP_BINARY", str(CUDA_LLAMA_BINARY if GPU_BACKEND_AVAILABLE else CPU_LLAMA_BINARY))
+os.environ.setdefault("LLAMA_CPP_NGL", DEFAULT_GPU_LAYERS)
 os.environ.setdefault("SURYA_INFERENCE_PARALLEL", "1")
 os.environ.setdefault("SURYA_INFERENCE_CTX_SIZE", "16384")
 
@@ -122,6 +135,77 @@ def page_text(data: dict) -> str:
     return f"===== PAGE {data['source_page_index'] + 1} =====\n" + "\n\n".join(lines)
 
 
+def profile_page_image(image) -> dict[str, object]:
+    """Measure page complexity from a small preview without running a second OCR pass.
+
+    The profile is only used for logging and optional recovery validation.  It
+    never changes normal-page OCR settings or rewrites recognized text.
+    """
+    width, height = image.size
+    preview = image.copy()
+    preview.thumbnail((480, 640))
+    histogram = preview.convert("L").histogram()
+    preview_pixels = max(1, sum(histogram))
+    # Count clearly dark pixels only.  Light scanner background is deliberately
+    # excluded so faded pages are not automatically treated as dense.
+    ink_ratio = sum(histogram[:210]) / preview_pixels
+    blank = bool(is_blank_region(image))
+    source_pixels = width * height
+    dense = not blank and (source_pixels >= 12_000_000 or ink_ratio >= 0.18)
+    return {
+        "blank": blank,
+        "risk": "dense" if dense else "normal",
+        "ink_ratio": round(ink_ratio, 4),
+        "source_pixels": source_pixels,
+    }
+
+
+def profile_detail(profile: dict[str, object]) -> str:
+    """Create a compact status message without adding profile data to exports."""
+    return (
+        f"profile={profile.get('risk', 'normal')} | "
+        f"ink={float(profile.get('ink_ratio', 0.0)):.1%} | "
+        f"pixels={int(profile.get('source_pixels', 0)):,}"
+    )
+
+
+def recognized_character_count(data: dict) -> int:
+    """Count visible OCR characters for conservative incomplete-page checks."""
+    return sum(
+        len(html_text(block.get("html", "")))
+        for block in data.get("blocks", [])
+        if not block.get("skipped")
+    )
+
+
+def validate_page_result(
+    data: dict,
+    profile: dict[str, object],
+    dense_policy: str,
+    minimum_dense_characters: int,
+) -> None:
+    """Reject only clearly unusable OCR results; normal pages retain existing behavior."""
+    if profile.get("blank"):
+        return
+    blocks = data.get("blocks")
+    if not isinstance(blocks, list) or not blocks:
+        raise RuntimeError("Surya returned no OCR blocks")
+    characters = recognized_character_count(data)
+    if characters == 0:
+        raise RuntimeError("Surya returned blocks without editable text")
+    # This stricter guard is opt-in.  It is intended for dense question-paper
+    # pages where a few returned blocks usually indicate truncated OCR output.
+    if (
+        dense_policy == "recover"
+        and profile.get("risk") == "dense"
+        and characters < minimum_dense_characters
+    ):
+        raise RuntimeError(
+            f"dense-page validation found only {characters} visible characters; "
+            "trying bounded split recovery"
+        )
+
+
 def progress(completed: int, total: int, page_number: int, elapsed: float, durations: list[float], status: str) -> None:
     percent = 100.0 * completed / total if total else 100.0
     filled = round(percent / 5)
@@ -193,6 +277,17 @@ def recognize_page(predictor, pdf: Path, page_index: int, split: bool, split_par
     images, _ = load_pdf(str(pdf), page_range=[page_index])
     image = images[0]
     event(f"Page {page_index + 1}: image loaded ({image.size[0]}x{image.size[1]})")
+    profile = profile_page_image(image)
+    event(f"Page {page_index + 1}: {profile_detail(profile)}")
+    if profile["blank"]:
+        event(f"Page {page_index + 1}: blank page detected; OCR inference skipped")
+        return {
+            "blocks": [],
+            "image_bbox": [0, 0, float(image.size[0]), float(image.size[1])],
+            "source_page_index": page_index,
+            "_surya_blank": True,
+            "_surya_profile": profile,
+        }
     if not split:
         event(f"Page {page_index + 1}: sending full page to OCR backend")
         results = predictor([image], full_page=True)
@@ -200,6 +295,7 @@ def recognize_page(predictor, pdf: Path, page_index: int, split: bool, split_par
             raise RuntimeError(f"Expected one page result, received {len(results)}")
         data = results[0].model_dump()
         data["source_page_index"] = page_index
+        data["_surya_profile"] = profile
         event(f"Page {page_index + 1}: full-page response received ({len(data.get('blocks', []))} blocks)")
         return data
 
@@ -247,6 +343,7 @@ def recognize_page(predictor, pdf: Path, page_index: int, split: bool, split_par
         "blocks": deduplicated,
         "image_bbox": [0, 0, float(width), float(height)],
         "source_page_index": page_index,
+        "_surya_profile": profile,
     }
 
 
@@ -264,6 +361,20 @@ def recognize_split_adaptive(
     images, _ = load_pdf(str(pdf), page_range=[page_index])
     image = images[0]
     width, height = image.size
+    profile = profile_page_image(image)
+    event(f"Page {page_index + 1}: {profile_detail(profile)}")
+    if profile["blank"]:
+        event(f"Page {page_index + 1}: blank page detected during recovery; OCR inference skipped")
+        return (
+            {
+                "blocks": [],
+                "image_bbox": [0, 0, float(width), float(height)],
+                "source_page_index": page_index,
+                "_surya_blank": True,
+                "_surya_profile": profile,
+            },
+            predictor,
+        )
     overlap = min(48, height // 20)
     boundaries = [round(height * part / split_parts) for part in range(split_parts + 1)]
     base_regions = [
@@ -366,6 +477,7 @@ def recognize_split_adaptive(
             "blocks": deduplicated,
             "image_bbox": [0, 0, float(width), float(height)],
             "source_page_index": page_index,
+            "_surya_profile": profile,
         },
         session[0],
     )
@@ -493,8 +605,11 @@ def main() -> int:
     parser.add_argument(
         "--page-timeout",
         type=int,
-        default=300,
-        help="Hard wall-clock seconds before a stuck page is stopped and split (default: 300)",
+        # A page that has not replied after 150 seconds is treated as stalled.
+        # Successful normal pages finish on the unchanged full-page GPU path;
+        # only the stalled page moves to the existing split recovery path.
+        default=150,
+        help="Hard wall-clock seconds before a stuck page is stopped and split (default: 150)",
     )
     parser.add_argument(
         "--inference-retries",
@@ -537,6 +652,21 @@ def main() -> int:
         default=2,
         help="How many times a failed region may be halved (default: 2)",
     )
+    parser.add_argument(
+        "--dense-page-policy",
+        choices=("observe", "recover"),
+        default="observe",
+        help=(
+            "observe logs lightweight page complexity only; recover also retries a "
+            "clearly truncated dense-page result using existing split recovery (default: observe)"
+        ),
+    )
+    parser.add_argument(
+        "--minimum-dense-characters",
+        type=int,
+        default=24,
+        help="Visible-character threshold for --dense-page-policy recover (default: 24)",
+    )
     parser.add_argument("--status", action="store_true", help="Show resumable cache status without running OCR")
     args = parser.parse_args()
     if args.request_timeout < 30:
@@ -555,6 +685,8 @@ def main() -> int:
         parser.error("--split-depth must be between 0 and 3")
     if not 2 <= args.split_parts <= 6:
         parser.error("--split-parts must be between 2 and 6")
+    if args.minimum_dense_characters < 1:
+        parser.error("--minimum-dense-characters must be positive")
     try:
         split_pages = {int(value.strip()) for value in args.split_pages.split(",") if value.strip()}
     except ValueError:
@@ -563,6 +695,12 @@ def main() -> int:
         parser.error("--split-pages values must be one-based positive page numbers")
     configure_bounded_inference(args.request_timeout, args.inference_retries)
     settings.SURYA_MAX_TOKENS_FULL_PAGE = args.max_page_tokens
+    backend_mode = "CUDA partial offload" if GPU_BACKEND_AVAILABLE else "CPU fallback"
+    event(
+        f"Inference backend: {backend_mode} | "
+        f"GPU layers: {os.environ.get('LLAMA_CPP_NGL', '0')} | "
+        f"binary: {Path(os.environ['LLAMA_CPP_BINARY']).name}"
+    )
 
     pdf = args.pdf
     if pdf is None:
@@ -674,12 +812,22 @@ def main() -> int:
                             args.split_parts,
                             args.page_timeout,
                         )
-                    if not isinstance(data.get("blocks"), list) or not data["blocks"]:
-                        raise RuntimeError("Surya returned no OCR blocks")
+                    profile = data.pop("_surya_profile", {})
+                    is_blank = bool(data.pop("_surya_blank", False))
+                    if is_blank:
+                        # A real blank page is a valid completed page.  It is
+                        # cached so later runs do not spend model time on it.
+                        data["blocks"] = []
+                    validate_page_result(
+                        data,
+                        {**profile, "blank": is_blank or bool(profile.get("blank"))},
+                        args.dense_page_policy,
+                        args.minimum_dense_characters,
+                    )
                     atomic_text(page_path(cache_dir, page_index), json.dumps(data, ensure_ascii=False, indent=2))
                     event(
                         f"Page {page_index + 1}: validation passed; "
-                        f"{len(data['blocks'])} blocks written atomically to cache"
+                        f"{len(data['blocks'])} blocks written atomically to cache | {profile_detail(profile)}"
                     )
                     error_file = cache_dir / f"page_{page_index + 1:04d}.error.json"
                     if error_file.exists():

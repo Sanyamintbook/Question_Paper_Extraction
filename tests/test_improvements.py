@@ -42,7 +42,8 @@ class ImprovementTests(unittest.TestCase):
         predictor = Predictor()
         with patch("run_surya.load_pdf", return_value=([Image.new("RGB", (200, 800), "white")], None)), patch(
             "run_surya.RecognitionPredictor", return_value=predictor
-        ):
+        ), patch("run_surya.is_blank_region", return_value=False):
+            # Exercise recovery independently of the blank-page shortcut.
             data, returned = recognize_split_adaptive(
                 predictor, object(), 0, split_parts=4, region_timeout=5,
                 region_tokens=512, max_depth=1

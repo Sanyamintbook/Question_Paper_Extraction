@@ -11,3 +11,9 @@ __pycache__/
 *.pyc
 *.bak
 runtime/lan_jobs/
+runtime/setup-check/
+reports/evaluation/
+.codex/
+.env
+.env.*
+!.env.example
