@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import sys
 import subprocess
+import tempfile
 import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from docx import Document
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "code"))
 
 from PIL import Image
 
 from document_parser import parse_questions, split_options
+from export_documents import build_word
 from excel_math import readable_math
 from run_surya import (
     PageStalledError,
@@ -25,6 +28,21 @@ from word_math import MATH_ATOM
 
 
 class ImprovementTests(unittest.TestCase):
+    def test_word_omits_standalone_margin_marks_between_translations(self):
+        pages = [{"source_page_index": 0, "blocks": [
+            {"reading_order": 0, "label": "Text", "html": "Figures in the right hand margin indicate full marks."},
+            {"reading_order": 1, "label": "Text", "html": "1. हिंदी प्रश्न?"},
+            {"reading_order": 2, "label": "Text", "html": "1"},
+            {"reading_order": 3, "label": "Text", "html": "What is the question?"},
+        ]}]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "output.docx"
+            build_word(pages, "Test", path)
+            paragraphs = [p.text for p in Document(path).paragraphs]
+        self.assertIn("1. हिंदी प्रश्न?", paragraphs)
+        self.assertIn("What is the question?", paragraphs)
+        self.assertNotIn("1", paragraphs)
+
     def test_failed_region_is_subdivided_without_losing_other_regions(self):
         class Result:
             def model_dump(self):

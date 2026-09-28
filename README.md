@@ -1,4 +1,10 @@
-# Surya OCR Exam Extractor
+# Mintbook OCR Exam Extractor
+
+Excel now uses dynamic section/question records, variable option columns, explicit
+marks, per-question pattern sheets and matching Column A/Column B output. See
+[dynamic extraction](docs/DYNAMIC_EXTRACTION.md) for the current behavior and
+optional AI configuration. Rules mode works without an additional model. The
+older fixed-column examples below describe the previous export layout.
 
 Isolated local experiment for extracting scanned, multilingual exam PDFs with
 Surya OCR. It does not import from or write to the existing `Pdf Extractor` or

@@ -4,10 +4,34 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "code"))
 
-from surya_lan_server import JOBS, LOCK, add_log, public_job, safe_pdf_name
+from surya_lan_server import JOBS, LOCK, PAGE, add_log, public_job, safe_pdf_name
 
 
 class SuryaLanTests(unittest.TestCase):
+    def test_ui_uses_mintbook_brand_and_short_labels(self):
+        self.assertIn("<title>Mintbook OCR</title>", PAGE)
+        self.assertIn("Create Word and Excel", PAGE)
+        self.assertIn("Processing details", PAGE)
+        self.assertNotIn("Surya OCR Studio", PAGE)
+
+    def test_ui_supports_pdf_folder_and_output_directory(self):
+        self.assertIn("webkitdirectory multiple", PAGE)
+        self.assertIn("showDirectoryPicker", PAGE)
+        self.assertIn("Process selected PDFs", PAGE)
+        self.assertIn("saveOutput", PAGE)
+
+    def test_analysis_stage_updates_job(self):
+        with LOCK:
+            JOBS["stage-test"] = {"log": "", "state": "ocr"}
+        try:
+            add_log("stage-test", "PIPELINE_STAGE: analyzing\n")
+            self.assertEqual(JOBS["stage-test"]["state"], "analyzing")
+            add_log("stage-test", "PIPELINE_STAGE: validating\n")
+            self.assertEqual(JOBS["stage-test"]["state"], "validating")
+        finally:
+            with LOCK:
+                JOBS.pop("stage-test", None)
+
     def test_filename_is_safe_and_pdf(self):
         self.assertEqual(safe_pdf_name(r"..\bad\science<script>.exe"), "science_script.pdf")
 

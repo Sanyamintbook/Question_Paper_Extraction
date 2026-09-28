@@ -127,7 +127,7 @@ class Question:
         return self.english_options.get(letter) or self.hindi_options.get(letter, "")
 
 
-def parse_questions(pages: list[dict]) -> list[Question]:
+def parse_legacy_questions(pages: list[dict]) -> list[Question]:
     questions: list[Question] = []
     current: Question | None = None
     section: str | None = None
@@ -290,3 +290,10 @@ def parse_questions(pages: list[dict]) -> list[Question]:
         for letter, value in question.hindi_options.items():
             existing.hindi_options[letter] = better(existing.hindi_options.get(letter, ""), value)
     return consolidated
+
+
+def parse_questions(pages):
+    """Flexible default; the earlier template-specific parser remains available."""
+    from paper_analyzer import analyze_rules
+    from question_validation import validate_analysis
+    return validate_analysis(analyze_rules(pages)).questions
