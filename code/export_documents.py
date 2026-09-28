@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 from collections import defaultdict
 from pathlib import Path
@@ -136,7 +137,7 @@ def cover_lines(pages: list[dict]) -> list[str]:
             continue
         text = text_of(block.get("html", ""))
         lower = text.lower()
-        if not text or "instructions for" in lower or "परीक्षार्थियों के लिये" in text:
+        if not text or "instruction" in lower or "निर्देश" in text or "নির্দেশ" in text:
             break
         if "booklet set code" in lower or "प्रश्न पुस्तिका सेट कोड" in text:
             continue
@@ -207,83 +208,19 @@ def add_cover_sheet(wb: Workbook, pages: list[dict]) -> None:
         ws.row_dimensions[index].height = 24
 
 
-def build_excel(pages: list[dict], questions, destination: Path) -> None:
-    wb = Workbook()
-    wb.remove(wb.active)
-    add_cover_sheet(wb, pages)
-    grouped = defaultdict(list)
-    for question in questions:
-        grouped[question.section].append(question)
-    names: set[str] = set()
-    intros = section_intros(pages)
-    for section, items in grouped.items():
-        languages = detected_languages(items) or ["English"]
-        if "MCQ" in section:
-            display_name = f"Section A - MCQ ({len(items)} Ques)"
-            headers = ["Q.No"]
-            headers.extend(f"Question ({language})" for language in languages)
-            for letter in "ABCD":
-                headers.extend(f"Option {letter} ({language})" for language in languages)
-            widths = [9] + [44] * len(languages) + [25] * (4 * len(languages))
-        elif "Short" in section:
-            display_name = f"Section B - Short Ans ({len(items)})"
-            headers = ["Q.No"] + [f"Question ({language})" for language in languages] + ["Marks", "Answer"]
-            widths = [9] + [46] * len(languages) + [10, 34]
-        else:
-            display_name = f"Section B - Long Ans ({len(items)})"
-            headers = ["Q.No"] + [f"Question ({language})" for language in languages] + ["Marks", "Answer"]
-            widths = [9] + [46] * len(languages) + [10, 34]
-        ws = wb.create_sheet(safe_sheet_name(display_name, names))
-        header_row = add_intro(ws, intros.get(section, []), len(headers))
-        ws.append(headers)
-        for question in items:
-            question_values = question_language_values(question)
-            if "MCQ" in section:
-                row = [question.number]
-                row.extend(readable_math(question_values.get(language, "")) for language in languages)
-                for letter in "ABCD":
-                    option_values = option_language_values(question, letter)
-                    row.extend(readable_math(option_values.get(language, "")) for language in languages)
-                ws.append(row)
-            else:
-                marks = 5 if "Long" in section else 2
-                ws.append(
-                    [question.number]
-                    + [readable_math(question_values.get(language, "")) for language in languages]
-                    + [marks, ""]
-                )
-        style_sheet(ws, header_row, widths)
-    if len(wb.sheetnames) == 1:
-        ws = wb.create_sheet("Questions")
-        headers = ["Q.No", "Question (English)", "Option A (English)", "Option B (English)", "Option C (English)", "Option D (English)"]
-        ws.append(headers)
-        style_sheet(ws, 1, [9, 44, 25, 25, 25, 25])
-    wb.save(destination)
+def build_excel(pages, questions, destination: Path, analysis=None) -> None:
+    from question_schema import Analysis
+    from paper_analyzer import source_blocks
+    from question_validation import validate_analysis
+    from dynamic_excel import build_dynamic_excel
+    if analysis is None:
+        analysis = validate_analysis(Analysis(questions=questions, sources=source_blocks(pages)))
+    build_dynamic_excel(analysis, destination, pages=pages)
 
 
-def write_validation(questions, stem: str) -> dict:
-    sections = defaultdict(list)
-    for question in questions:
-        sections[question.section].append(question)
-    report = {"document": stem, "total_questions": len(questions), "sections": {}}
-    for name, items in sections.items():
-        numbers = [item.number for item in items]
-        missing_numbers = []
-        if numbers:
-            present = set(numbers)
-            missing_numbers = [number for number in range(min(numbers), max(numbers) + 1) if number not in present]
-        report["sections"][name] = {
-            "questions": len(items),
-            "number_range": [min(numbers), max(numbers)] if numbers else None,
-            "missing_numbers": missing_numbers,
-            "missing_english": [item.number for item in items if not item.english],
-            "missing_hindi": [item.number for item in items if not item.hindi],
-            "incomplete_options": [
-                item.number
-                for item in items
-                if "MCQ" in name and any(not item.option(letter) for letter in "ABCD")
-            ],
-        }
+def write_validation(analysis, stem: str) -> dict:
+    from question_validation import validation_report
+    report = {"document": stem, **validation_report(analysis)}
     EVALUATION.mkdir(parents=True, exist_ok=True)
     (EVALUATION / f"{stem}_structure.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -303,6 +240,10 @@ def build_word(pages: list[dict], title: str, destination: Path) -> int:
     renderer = WordMathRenderer()
     failures = 0
     last_section = ""
+    margin_marks = any(
+        re.search(r"(?:right.hand margin.*marks|हाशिये.*अंक)", text_of(block.get("html", "")), re.I)
+        for page in pages for block in page.get("blocks", [])
+    )
     for page_index, page in enumerate(pages):
         duplicate_pool: set[str] = set()
         blocks = sorted(page.get("blocks", []), key=lambda b: b.get("reading_order", 0))
@@ -327,6 +268,11 @@ def build_word(pages: list[dict], title: str, destination: Path) -> int:
             ]
             emitted = 0
             for line, key in zip(logical_lines, normalized):
+                # Papers that declare marks in the margin often place a bare
+                # "1" between the Hindi and English versions. It is metadata,
+                # not a second question or part of either translation.
+                if margin_marks and re.fullmatch(r"\(?\s*\d{1,2}(?:\.0)?\s*\)?", line.text.strip()):
+                    continue
                 if len(logical_lines) == 1 and key and key in duplicate_pool:
                     duplicate_pool.remove(key)
                     continue
@@ -363,6 +309,10 @@ def main() -> int:
         default=DESTINATION,
         help="Output directory (default: output/documents)",
     )
+    parser.add_argument("--analysis", choices=("rules", "ai"),
+                        default=os.environ.get("PAPER_ANALYSIS_MODE", "rules"))
+    parser.add_argument("--structured-input", type=Path,
+                        help="Reuse saved analysis JSON; source must match the OCR input")
     args = parser.parse_args()
     files = [args.json] if args.json else sorted(SOURCE.glob("*_surya.json"))
     files = [path.resolve() for path in files if path and path.exists()]
@@ -375,18 +325,30 @@ def main() -> int:
         print(f"[{index}/{len(files)}] Reading preserved OCR: {source.name}")
         pages = json.loads(source.read_text(encoding="utf-8"))
         stem = source.stem.removesuffix("_surya")
-        questions = parse_questions(pages)
+        from paper_analyzer import analyze_paper, source_blocks
+        from question_schema import Analysis
+        from question_validation import validate_analysis
+        print("PIPELINE_STAGE: analyzing", flush=True)
+        if args.structured_input:
+            analysis = Analysis.model_validate_json(args.structured_input.read_text(encoding="utf-8"))
+            if analysis.sources != source_blocks(pages):
+                raise ValueError("Saved analysis does not match this OCR input")
+        else:
+            analysis = analyze_paper(pages, args.analysis)
+        print("PIPELINE_STAGE: validating", flush=True)
+        analysis = validate_analysis(analysis)
+        questions = analysis.questions
+        for note in analysis.notes:
+            print(f"REVIEW: {note}", flush=True)
+        structured = destination / f"{stem}_analysis.json"
+        structured.write_text(analysis.model_dump_json(indent=2), encoding="utf-8")
+        print("PIPELINE_STAGE: exporting", flush=True)
         print(f"[{index}/{len(files)}] Parsed {len(questions)} question records; creating Word...")
         failures = build_word(pages, stem, destination / f"{stem}.docx")
         print(f"[{index}/{len(files)}] Creating section-wise Excel...")
-        build_excel(pages, questions, destination / f"{stem}.xlsx")
-        report = write_validation(questions, stem)
-        review_count = sum(
-            len(details["missing_english"])
-            + len(details["missing_hindi"])
-            + len(details["incomplete_options"])
-            for details in report["sections"].values()
-        )
+        build_excel(pages, questions, destination / f"{stem}.xlsx", analysis=analysis)
+        report = write_validation(analysis, stem)
+        review_count = report["review_items"]
         print(
             f"[{index}/{len(files)}] Completed {stem}: {len(questions)} questions, "
             f"{failures} equation(s) kept as original text, {review_count} structural review item(s)."
